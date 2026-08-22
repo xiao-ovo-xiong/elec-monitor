@@ -173,13 +173,25 @@ TEMPLATE = """<!DOCTYPE html>
   html,body{margin:0;padding:0;background:#f2f4f7;color:#1f2937;
     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
   #app{display:flex;flex-direction:column;height:100vh;height:100dvh;max-width:640px;margin:0 auto}
-  #summary{background:#fff;margin:10px 12px 8px;padding:16px 20px 12px;border-radius:16px;
-    box-shadow:0 1px 4px rgba(0,0,0,.06)}
+  #summary{position:relative;overflow:hidden;background:linear-gradient(180deg,#ffffff 0%,#fbfdff 100%);
+    margin:10px 12px 8px;padding:16px 20px 12px;border-radius:16px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+  #summary::before{content:'';position:absolute;left:0;top:0;right:0;height:3px;
+    background:linear-gradient(90deg,#2563eb,#60a5fa)}
   #summary .label{font-size:13px;color:#9ca3af;letter-spacing:1px}
   #summary .row{display:flex;align-items:baseline;margin-top:4px}
   #summary .val{font-size:clamp(34px,10vw,48px);font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums}
+  #summary .val.flash{animation:flash 1s ease}
+  @keyframes flash{0%{color:#2563eb}50%{color:#1d4ed8}100%{color:#1f2937}}
   #summary .unit{font-size:15px;color:#9ca3af;margin-left:6px}
   #meta{margin-top:8px;font-size:12px;color:#9ca3af;display:flex;gap:12px;flex-wrap:wrap}
+  #status{display:flex;align-items:center;gap:7px;margin-top:9px;font-size:12px;color:#8b95a5}
+  #status .dot{width:9px;height:9px;border-radius:50%;background:#93c5fd;flex:none}
+  #status.loading .dot{background:transparent;border:2px solid #dbe4f7;border-top-color:#2563eb;
+    animation:rot .9s linear infinite}
+  #status.updated{color:#16a34a}
+  #status.updated .dot{background:#22c55e;animation:pop .4s ease}
+  @keyframes rot{to{transform:rotate(360deg)}}
+  @keyframes pop{0%{transform:scale(.5)}60%{transform:scale(1.3)}100%{transform:scale(1)}}
   #ranges{display:flex;gap:8px;margin-top:12px}
   #ranges button{flex:1;border:1px solid #e5e7eb;background:#f9fafb;border-radius:999px;
     padding:6px 0;font-size:12px;color:#6b7280;cursor:pointer}
@@ -197,6 +209,7 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="label">当前剩余电量</div>
     <div class="row"><span class="val" id="val">--</span><span class="unit">度</span></div>
     <div class="meta" id="meta"></div>
+    <div id="status"><span class="dot"></span><span id="sttxt">自动更新中</span></div>
     <div id="ranges">
       <button data-r="all" class="on">全部</button>
       <button data-r="7">近7天</button>
@@ -204,7 +217,7 @@ TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
   <div id="chart"><canvas id="cv"></canvas></div>
-  <div id="foot">数据来自南昌工学院智能收费系统（__ROOM__）<br>约 30 分钟采集一次 · 本页静默自动更新，无需手动刷新</div>
+  <div id="foot">数据来自南昌工学院智能收费系统（__ROOM__）<br>约 10 分钟采集一次 · 自动更新，有变化时数字与曲线会动起来</div>
 </div>
 <script>
 var RAW = __DATA__;
@@ -213,21 +226,65 @@ function fmtDT(ts){
   return pad(ts.getMonth()+1) + '-' + pad(ts.getDate()) + ' ' +
          pad(ts.getHours()) + ':' + pad(ts.getMinutes());
 }
-function renderCard(){
+/* ============ 顶部卡片 + 状态指示 ============ */
+var prevTotal = null;
+var numAnim = null;
+function renderCard(roll){
   var last = RAW.length ? RAW[RAW.length - 1] : null;
   var total = last ? Number(last[3]) : null;
-  document.getElementById('val').textContent =
-      (total === null || isNaN(total)) ? '--' : total.toFixed(2);
+  var valEl = document.getElementById('val');
+  var target = (total === null || isNaN(total)) ? null : total;
+  if (roll && target !== null && prevTotal !== null && isFinite(prevTotal) && prevTotal !== target){
+    if (numAnim) cancelAnimationFrame(numAnim);
+    var from = prevTotal, to = target, t0 = performance.now();
+    function step(now){
+      var k = Math.min(1, (now - t0) / 500);
+      var e = 1 - Math.pow(1 - k, 3);
+      valEl.textContent = (from + (to - from) * e).toFixed(2);
+      if (k < 1){ numAnim = requestAnimationFrame(step); }
+      else {
+        valEl.textContent = to.toFixed(2);
+        valEl.classList.remove('flash'); void valEl.offsetWidth;
+        valEl.classList.add('flash');
+      }
+    }
+    numAnim = requestAnimationFrame(step);
+  } else {
+    valEl.textContent = (target === null) ? '--' : target.toFixed(2);
+  }
+  prevTotal = target;
   var ts = last ? new Date(last[0]) : null;
   var tstr = ts ? fmtDT(ts) : '--';
   document.getElementById('meta').innerHTML =
       '共 <b>' + RAW.length + '</b> 条记录<span style="margin:0 6px">·</span>更新于 ' + tstr;
 }
+var stEl = document.getElementById('status'), stTxt = document.getElementById('sttxt');
+function setStatus(mode){
+  stEl.className = mode;
+  if (mode === 'loading') stTxt.textContent = '正在更新…';
+  else if (mode === 'updated') stTxt.textContent = '刚刚更新 ✓';
+  else stTxt.textContent = '自动更新中';
+}
 /* ============ 纯 Canvas 折线图 (零外部依赖, 秒开) ============ */
 var canvas = document.getElementById('cv');
 var ctx = canvas.getContext('2d');
 var RANGE = 'all';
-function draw(){
+var animT = null;
+function traceLine(px, py, n){
+  ctx.moveTo(px[0], py[0]);
+  if (n === 1) return;
+  if (n === 2){ ctx.lineTo(px[1], py[1]); return; }
+  for (var i = 0; i < n - 1; i++){
+    var p0x = px[Math.max(i - 1, 0)], p0y = py[Math.max(i - 1, 0)];
+    var p1x = px[i], p1y = py[i];
+    var p2x = px[i + 1], p2y = py[i + 1];
+    var p3x = px[Math.min(i + 2, n - 1)], p3y = py[Math.min(i + 2, n - 1)];
+    ctx.bezierCurveTo(p1x + (p2x - p0x) / 6, p1y + (p2y - p0y) / 6,
+                      p2x - (p3x - p1x) / 6, p2y - (p3y - p1y) / 6,
+                      p2x, p2y);
+  }
+}
+function draw(pg){
   var dpr = window.devicePixelRatio || 1;
   var w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h){ canvas.width = canvas.height = 0; return; }
@@ -266,6 +323,11 @@ function draw(){
   var span = (t1 - t0) || 1;
   function X(t){ return padL + (t.getTime() - t0) / span * pw; }
   function Y(v){ return padT + (hi - v) / (hi - lo) * ph; }
+  var px = [], py = [];
+  for (var a = 0; a < pts.length; a++){
+    px.push(X(pts[a].t)); py.push(Y(pts[a].v));
+  }
+  /* 网格 + Y轴刻度 */
   ctx.font = '10px sans-serif'; ctx.textBaseline = 'middle';
   var steps = 4;
   for (var s = 0; s <= steps; s++){
@@ -276,6 +338,7 @@ function draw(){
     ctx.fillStyle = '#9ca3af'; ctx.textAlign = 'right';
     ctx.fillText(vv.toFixed(1), padL - 6, yy);
   }
+  /* X轴时间刻度 */
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
   ctx.fillStyle = '#9ca3af';
   ctx.fillText(fmtDT(pts[0].t), padL, padT + ph + 6);
@@ -285,46 +348,69 @@ function draw(){
     ctx.fillText(pad(mid.getMonth()+1) + '-' + pad(mid.getDate()) + ' ' +
                  pad(mid.getHours()) + ':00', padL + pw / 2, padT + ph + 6);
   }
+  var pDone = (pg === undefined || pg === null) ? 1 : pg;
+  if (pDone < 1){
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(padL, padT - 3, Math.max(1, pw * pDone) + 3, ph + 6);
+    ctx.clip();
+  }
   /* 渐变面积 */
   ctx.beginPath();
-  ctx.moveTo(X(pts[0].t), Y(pts[0].v));
-  for (var k = 1; k < pts.length; k++) ctx.lineTo(X(pts[k].t), Y(pts[k].v));
-  ctx.lineTo(X(pts[pts.length - 1].t), padT + ph);
-  ctx.lineTo(X(pts[0].t), padT + ph);
+  ctx.moveTo(px[0], py[0]);
+  traceLine(px, py, pts.length);
+  ctx.lineTo(px[px.length - 1], padT + ph);
+  ctx.lineTo(px[0], padT + ph);
   ctx.closePath();
   var g = ctx.createLinearGradient(0, padT, 0, padT + ph);
   g.addColorStop(0, 'rgba(37,99,235,.22)');
   g.addColorStop(1, 'rgba(37,99,235,0)');
   ctx.fillStyle = g; ctx.fill();
-  /* 折线 */
+  /* 平滑折线 */
   ctx.beginPath();
-  ctx.moveTo(X(pts[0].t), Y(pts[0].v));
-  for (var m = 1; m < pts.length; m++) ctx.lineTo(X(pts[m].t), Y(pts[m].v));
+  traceLine(px, py, pts.length);
   ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.2;
   ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
-  /* 最后一点高亮 + 数值 */
-  var lp = pts[pts.length - 1];
-  ctx.beginPath(); ctx.arc(X(lp.t), Y(lp.v), 4.5, 0, Math.PI * 2);
-  ctx.fillStyle = '#fff'; ctx.fill();
-  ctx.lineWidth = 2.5; ctx.strokeStyle = '#2563eb'; ctx.stroke();
-  ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-  ctx.fillStyle = '#2563eb';
-  ctx.fillText(lp.v.toFixed(1) + ' 度', Math.min(X(lp.t) + 8, padL + pw - 64), Y(lp.v) - 6);
+  if (pDone < 1) ctx.restore();
+  /* 末点高亮 + 数值 (动画播完才显示) */
+  if (pDone >= 0.999){
+    var lp = pts[pts.length - 1];
+    ctx.beginPath(); ctx.arc(px[px.length - 1], py[py.length - 1], 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.lineWidth = 2.5; ctx.strokeStyle = '#2563eb'; ctx.stroke();
+    ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+    ctx.fillStyle = '#2563eb';
+    ctx.fillText(lp.v.toFixed(1) + ' 度',
+                 Math.min(px[px.length - 1] + 8, padL + pw - 64), py[py.length - 1] - 6);
+  }
 }
-/* ============ 范围切换按钮 ============ */
+function animate(pgFrom, ms, done){
+  if (animT) cancelAnimationFrame(animT);
+  var t0 = performance.now(), len = Math.max(1, ms);
+  function step(now){
+    var k = Math.min(1, (now - t0) / len);
+    var e = 1 - Math.pow(1 - k, 3);
+    draw(pgFrom + (1 - pgFrom) * e);
+    if (k < 1){ animT = requestAnimationFrame(step); }
+    else { animT = null; if (done) done(); }
+  }
+  animT = requestAnimationFrame(step);
+}
+/* ============ 范围切换 ============ */
 var btns = document.querySelectorAll('#ranges button');
 for (var b = 0; b < btns.length; b++){
   btns[b].addEventListener('click', function(){
     RANGE = this.getAttribute('data-r');
     for (var q = 0; q < btns.length; q++) btns[q].className = '';
     this.className = 'on';
-    draw();
+    animate(0, 420);
   });
 }
-/* ============ 静默原地刷新 (免整页重载; 本地 file:// 时退回整页刷新) ============ */
+/* ============ 拉新数据 + 可视化反馈 (本地 file:// 退回整页刷新) ============ */
 var useFetch = location.protocol !== 'file:';
 function refresh(){
   if (!useFetch){ location.reload(); return; }
+  setStatus('loading');
   fetch('monitor_data.csv', {cache: 'no-store'})
     .then(function(r){ if (!r.ok) throw new Error('http ' + r.status); return r.text(); })
     .then(function(txt){
@@ -338,7 +424,15 @@ function refresh(){
           if (!isNaN(v1) && !isNaN(v3)) rows.push([p[0], v1, Number(p[2]), v3]);
         }
       }
-      if (rows.length){ RAW = rows; renderCard(); draw(); }
+      if (rows.length && rows.length !== RAW.length){
+        RAW = rows;
+        renderCard(true);
+        setStatus('updated');
+        animate(0, 700);
+        setTimeout(function(){ setStatus('idle'); }, 3000);
+      } else if (rows.length){
+        setStatus('idle');
+      }
     })
     .catch(function(){ location.reload(); });
 }
@@ -350,10 +444,13 @@ if (useFetch){
 }
 /* ============ 启动 ============ */
 renderCard();
-draw();
-window.addEventListener('resize', draw);
-window.addEventListener('orientationchange', function(){ setTimeout(draw, 300); });
-requestAnimationFrame(draw);
+setStatus('idle');
+window.addEventListener('resize', function(){
+  if (animT){ cancelAnimationFrame(animT); animT = null; }
+  draw(1);
+});
+window.addEventListener('orientationchange', function(){ setTimeout(function(){ draw(1); }, 300); });
+animate(0, 750);
 </script>
 </body>
 </html>
