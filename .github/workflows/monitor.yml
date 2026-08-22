@@ -2,8 +2,8 @@ name: electricity-monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch:
+    - cron: "*/10 * * * *"     # 每10分钟一次(UTC时间; 北京时间=UTC+8)
+  workflow_dispatch:           # 支持手动触发(部署后先手动测一次)
 
 concurrency:
   group: electricity-monitor
@@ -18,13 +18,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: pip install requests
+
       - name: Collect electricity data
         run: python monitor_electricity.py
+
       - name: Commit and push
         run: |
           git config user.name "electricity-monitor-bot"
