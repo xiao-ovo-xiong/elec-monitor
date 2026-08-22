@@ -141,9 +141,8 @@ def make_charts(rows):
         try:
             times = [r[0] for r in rows]
             fig, ax = plt.subplots(figsize=(11, 5))
-            ax.plot(times, [r[3] for r in rows], label="合计(度)", lw=2.2, marker="o", ms=3)
-            ax.plot(times, [r[1] for r in rows], label="剩余购电(度)", lw=1.6, marker="o", ms=3)
-            ax.plot(times, [r[2] for r in rows], label="剩余补助(度)", lw=1.2, ls="--", marker="o", ms=2.5)
+            ax.plot(times, [r[3] for r in rows], label="剩余电量(度)", lw=2.2,
+                    marker="o", ms=3, color="#2563eb")
             ax.set_title("宿舍剩余电量监测 %s" % ROOM)
             ax.set_ylabel("度")
             ax.grid(True, alpha=0.3)
@@ -167,35 +166,112 @@ TEMPLATE = """<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>宿舍剩余电量监测</title>
-<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
-<style>html,body{margin:0;padding:0;background:#f6f7f9}#chart{width:100vw;height:100vh}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>宿舍剩余电量</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0;background:#f2f4f7;color:#1f2937;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  #app{display:flex;flex-direction:column;height:100vh;height:100dvh;max-width:640px;margin:0 auto}
+  #summary{background:#fff;margin:10px 12px 8px;padding:18px 20px;border-radius:16px;
+    box-shadow:0 1px 4px rgba(0,0,0,.06)}
+  #summary .label{font-size:13px;color:#9ca3af;letter-spacing:1px}
+  #summary .row{display:flex;align-items:baseline;margin-top:4px}
+  #summary .val{font-size:clamp(34px,10vw,48px);font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums}
+  #summary .unit{font-size:15px;color:#9ca3af;margin-left:6px}
+  #meta{margin-top:8px;font-size:12px;color:#9ca3af;display:flex;gap:12px;flex-wrap:wrap}
+  #chart{flex:1;min-height:240px;background:#fff;margin:0 12px 8px;border-radius:16px;
+    box-shadow:0 1px 4px rgba(0,0,0,.06);position:relative}
+  #empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    color:#9ca3af;font-size:13px}
+  #foot{padding:0 16px calc(12px + env(safe-area-inset-bottom));font-size:11px;
+    color:#b6bec9;text-align:center;line-height:1.6}
+</style>
 </head>
 <body>
-<div id="chart"></div>
+<div id="app">
+  <div id="summary">
+    <div class="label">当前剩余电量</div>
+    <div class="row"><span class="val" id="val">--</span><span class="unit">度</span></div>
+    <div class="meta" id="meta"></div>
+  </div>
+  <div id="chart"><div id="empty" style="display:none">暂无数据</div></div>
+  <div id="foot">数据来自南昌工学院智能收费系统（__ROOM__）<br>约 30 分钟采集一次 · 页面每 5 分钟自动刷新</div>
+</div>
 <script>
 var RAW = __DATA__;
-var chart = echarts.init(document.getElementById('chart'));
-chart.setOption({
-  title: {text: '南昌工学院 __ROOM__ 剩余电量监测', subtext: '共 __COUNT__ 条记录, 约30分钟采集一次, 本页每5分钟自动刷新', left: 'center'},
-  tooltip: {trigger: 'axis', valueFormatter: function(v){ return v + ' 度'; }},
-  legend: {bottom: 8, data: ['合计剩余', '剩余购电', '剩余补助']},
-  grid: {left: 60, right: 30, top: 70, bottom: 60},
-  xAxis: {type: 'time'},
-  yAxis: {type: 'value', name: '度'},
-  dataZoom: [{type: 'inside'}, {type: 'slider', height: 18, bottom: 20}],
-  series: [
-    {name: '合计剩余', type: 'line', symbolSize: 5, lineStyle: {width: 2.6},
-     data: RAW.map(function(r){ return [r[0], r[3]]; })},
-    {name: '剩余购电', type: 'line', symbolSize: 4, lineStyle: {width: 1.6},
-     data: RAW.map(function(r){ return [r[0], r[1]]; })},
-    {name: '剩余补助', type: 'line', symbolSize: 3, lineStyle: {width: 1.2, type: 'dashed'},
-     data: RAW.map(function(r){ return [r[0], r[2]]; })}
-  ]
-});
-setTimeout(function(){ location.reload(); }, 5 * 60 * 1000);
-window.addEventListener('resize', function(){ chart.resize(); });
+var CDNS = [
+  'https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js',
+  'https://cdn.staticfile.org/echarts/5.4.3/echarts.min.js',
+  'https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js',
+  'https://unpkg.com/echarts@5.4.3/dist/echarts.min.js'
+];
+function boot(i){
+  if (i >= CDNS.length) {
+    document.getElementById('empty').style.display = 'flex';
+    document.getElementById('empty').textContent = '图表组件加载失败, 请检查网络后刷新';
+    return;
+  }
+  var s = document.createElement('script');
+  s.src = CDNS[i];
+  s.onload = function(){ window.echarts ? initChart() : boot(i + 1); };
+  s.onerror = function(){ boot(i + 1); };
+  document.head.appendChild(s);
+}
+/* ---- 顶部数字卡片: 不依赖图表库, 立即渲染 ---- */
+(function(){
+  var last = RAW.length ? RAW[RAW.length - 1] : null;
+  var total = last ? Number(last[3]) : null;
+  document.getElementById('val').textContent =
+      (total === null || isNaN(total)) ? '--' : total.toFixed(2);
+  var meta = document.getElementById('meta');
+  var ts = last ? new Date(last[0]) : null;
+  function pad(n){ return n < 10 ? '0' + n : '' + n; }
+  var tstr = ts ? pad(ts.getMonth()+1) + '-' + pad(ts.getDate()) + ' ' +
+                   pad(ts.getHours()) + ':' + pad(ts.getMinutes()) : '--';
+  meta.innerHTML = '共 <b>' + RAW.length + '</b> 条记录<span style="margin:0 6px">·</span>更新于 ' + tstr;
+})();
+/* ---- 折线图: 图表库加载完成后才初始化 ---- */
+function initChart(){
+  var chartEl = document.getElementById('chart');
+  if (!RAW.length) {
+    document.getElementById('empty').style.display = 'flex';
+    return;
+  }
+  var isMobile = window.innerWidth < 768;
+  var pts = RAW.map(function(r){ return [r[0], Number(r[3])]; });
+  var chart = echarts.init(chartEl);
+  var dz = [{type: 'inside'}];
+  if (!isMobile) {
+    dz.push({type: 'slider', height: 16, bottom: 10});
+  }
+  chart.setOption({
+    tooltip: {trigger: 'axis', backgroundColor:'rgba(17,24,39,.92)', borderWidth:0,
+      textStyle:{color:'#fff', fontSize:12},
+      valueFormatter: function(v){ return Number(v).toFixed(2) + ' 度'; }},
+    grid: {left: 14, right: 14, top: 18, bottom: 26, containLabel: true},
+    xAxis: {type: 'time', axisLabel:{fontSize:10, color:'#9ca3af'},
+      axisLine:{lineStyle:{color:'#e5e7eb'}}, axisTick:{show:false},
+      splitLine:{show:false}},
+    yAxis: {type: 'value', name: '度', nameTextStyle:{color:'#9ca3af', fontSize:10},
+      axisLabel:{fontSize:10, color:'#9ca3af'},
+      axisLine:{show:false}, axisTick:{show:false}, splitLine:{lineStyle:{color:'#f1f2f4', type:'dashed'}}},
+    dataZoom: dz,
+    series: [{
+      name: '剩余电量', type: 'line', smooth: 0.3, symbol: 'circle',
+      symbolSize: 4, showSymbol: RAW.length < 40, data: pts,
+      lineStyle:{width: 2.5, color:'#2563eb'},
+      itemStyle:{color:'#2563eb'},
+      areaStyle:{color:{type:'linear', x:0, y:0, x2:0, y2:1,
+        colorStops:[{offset:0, color:'rgba(37,99,235,.22)'},{offset:1, color:'rgba(37,99,235,0)'}]}}
+    }]
+  });
+  function rs(){ chart.resize(); }
+  window.addEventListener('resize', rs);
+  window.addEventListener('orientationchange', function(){ setTimeout(rs, 300); });
+  setTimeout(function(){ location.reload(); }, 5 * 60 * 1000);
+}
+boot(0);
 </script>
 </body>
 </html>
