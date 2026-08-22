@@ -173,17 +173,20 @@ TEMPLATE = """<!DOCTYPE html>
   html,body{margin:0;padding:0;background:#f2f4f7;color:#1f2937;
     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
   #app{display:flex;flex-direction:column;height:100vh;height:100dvh;max-width:640px;margin:0 auto}
-  #summary{background:#fff;margin:10px 12px 8px;padding:18px 20px;border-radius:16px;
+  #summary{background:#fff;margin:10px 12px 8px;padding:16px 20px 12px;border-radius:16px;
     box-shadow:0 1px 4px rgba(0,0,0,.06)}
   #summary .label{font-size:13px;color:#9ca3af;letter-spacing:1px}
   #summary .row{display:flex;align-items:baseline;margin-top:4px}
   #summary .val{font-size:clamp(34px,10vw,48px);font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums}
   #summary .unit{font-size:15px;color:#9ca3af;margin-left:6px}
   #meta{margin-top:8px;font-size:12px;color:#9ca3af;display:flex;gap:12px;flex-wrap:wrap}
+  #ranges{display:flex;gap:8px;margin-top:12px}
+  #ranges button{flex:1;border:1px solid #e5e7eb;background:#f9fafb;border-radius:999px;
+    padding:6px 0;font-size:12px;color:#6b7280;cursor:pointer}
+  #ranges button.on{background:#2563eb;color:#fff;border-color:#2563eb}
   #chart{flex:1;min-height:240px;background:#fff;margin:0 12px 8px;border-radius:16px;
-    box-shadow:0 1px 4px rgba(0,0,0,.06);position:relative}
-  #empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-    color:#9ca3af;font-size:13px}
+    box-shadow:0 1px 4px rgba(0,0,0,.06);overflow:hidden}
+  #cv{display:block;width:100%;height:100%}
   #foot{padding:0 16px calc(12px + env(safe-area-inset-bottom));font-size:11px;
     color:#b6bec9;text-align:center;line-height:1.6}
 </style>
@@ -194,84 +197,163 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="label">当前剩余电量</div>
     <div class="row"><span class="val" id="val">--</span><span class="unit">度</span></div>
     <div class="meta" id="meta"></div>
+    <div id="ranges">
+      <button data-r="all" class="on">全部</button>
+      <button data-r="7">近7天</button>
+      <button data-r="30">近30天</button>
+    </div>
   </div>
-  <div id="chart"><div id="empty" style="display:none">暂无数据</div></div>
-  <div id="foot">数据来自南昌工学院智能收费系统（__ROOM__）<br>约 30 分钟采集一次 · 页面每 5 分钟自动刷新</div>
+  <div id="chart"><canvas id="cv"></canvas></div>
+  <div id="foot">数据来自南昌工学院智能收费系统（__ROOM__）<br>约 30 分钟采集一次 · 本页静默自动更新，无需手动刷新</div>
 </div>
 <script>
 var RAW = __DATA__;
-var CDNS = [
-  'https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js',
-  'https://cdn.staticfile.org/echarts/5.4.3/echarts.min.js',
-  'https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js',
-  'https://unpkg.com/echarts@5.4.3/dist/echarts.min.js'
-];
-function boot(i){
-  if (i >= CDNS.length) {
-    document.getElementById('empty').style.display = 'flex';
-    document.getElementById('empty').textContent = '图表组件加载失败, 请检查网络后刷新';
-    return;
-  }
-  var s = document.createElement('script');
-  s.src = CDNS[i];
-  s.onload = function(){ window.echarts ? initChart() : boot(i + 1); };
-  s.onerror = function(){ boot(i + 1); };
-  document.head.appendChild(s);
+function pad(n){ return n < 10 ? '0' + n : '' + n; }
+function fmtDT(ts){
+  return pad(ts.getMonth()+1) + '-' + pad(ts.getDate()) + ' ' +
+         pad(ts.getHours()) + ':' + pad(ts.getMinutes());
 }
-/* ---- 顶部数字卡片: 不依赖图表库, 立即渲染 ---- */
-(function(){
+function renderCard(){
   var last = RAW.length ? RAW[RAW.length - 1] : null;
   var total = last ? Number(last[3]) : null;
   document.getElementById('val').textContent =
       (total === null || isNaN(total)) ? '--' : total.toFixed(2);
-  var meta = document.getElementById('meta');
   var ts = last ? new Date(last[0]) : null;
-  function pad(n){ return n < 10 ? '0' + n : '' + n; }
-  var tstr = ts ? pad(ts.getMonth()+1) + '-' + pad(ts.getDate()) + ' ' +
-                   pad(ts.getHours()) + ':' + pad(ts.getMinutes()) : '--';
-  meta.innerHTML = '共 <b>' + RAW.length + '</b> 条记录<span style="margin:0 6px">·</span>更新于 ' + tstr;
-})();
-/* ---- 折线图: 图表库加载完成后才初始化 ---- */
-function initChart(){
-  var chartEl = document.getElementById('chart');
-  if (!RAW.length) {
-    document.getElementById('empty').style.display = 'flex';
+  var tstr = ts ? fmtDT(ts) : '--';
+  document.getElementById('meta').innerHTML =
+      '共 <b>' + RAW.length + '</b> 条记录<span style="margin:0 6px">·</span>更新于 ' + tstr;
+}
+/* ============ 纯 Canvas 折线图 (零外部依赖, 秒开) ============ */
+var canvas = document.getElementById('cv');
+var ctx = canvas.getContext('2d');
+var RANGE = 'all';
+function draw(){
+  var dpr = window.devicePixelRatio || 1;
+  var w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h){ canvas.width = canvas.height = 0; return; }
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  var pts = [];
+  for (var i = 0; i < RAW.length; i++){
+    var v = Number(RAW[i][3]);
+    if (isNaN(v)) continue;
+    pts.push({t: new Date(RAW[i][0]), v: v});
+  }
+  if (RANGE !== 'all' && pts.length){
+    var end = pts[pts.length - 1].t.getTime();
+    var start = end - parseInt(RANGE, 10) * 86400000;
+    pts = pts.filter(function(p){ return p.t.getTime() >= start; });
+  }
+  if (!pts.length){
+    ctx.fillStyle = '#9ca3af'; ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('暂无数据', w / 2, h / 2);
     return;
   }
-  var isMobile = window.innerWidth < 768;
-  var pts = RAW.map(function(r){ return [r[0], Number(r[3])]; });
-  var chart = echarts.init(chartEl);
-  var dz = [{type: 'inside'}];
-  if (!isMobile) {
-    dz.push({type: 'slider', height: 16, bottom: 10});
+  var padL = 46, padR = 14, padT = 12, padB = 26;
+  var pw = w - padL - padR, ph = h - padT - padB;
+  var mn = Infinity, mx = -Infinity;
+  for (var j = 0; j < pts.length; j++){
+    if (pts[j].v < mn) mn = pts[j].v;
+    if (pts[j].v > mx) mx = pts[j].v;
   }
-  chart.setOption({
-    tooltip: {trigger: 'axis', backgroundColor:'rgba(17,24,39,.92)', borderWidth:0,
-      textStyle:{color:'#fff', fontSize:12},
-      valueFormatter: function(v){ return Number(v).toFixed(2) + ' 度'; }},
-    grid: {left: 14, right: 14, top: 18, bottom: 26, containLabel: true},
-    xAxis: {type: 'time', axisLabel:{fontSize:10, color:'#9ca3af'},
-      axisLine:{lineStyle:{color:'#e5e7eb'}}, axisTick:{show:false},
-      splitLine:{show:false}},
-    yAxis: {type: 'value', name: '度', nameTextStyle:{color:'#9ca3af', fontSize:10},
-      axisLabel:{fontSize:10, color:'#9ca3af'},
-      axisLine:{show:false}, axisTick:{show:false}, splitLine:{lineStyle:{color:'#f1f2f4', type:'dashed'}}},
-    dataZoom: dz,
-    series: [{
-      name: '剩余电量', type: 'line', smooth: 0.3, symbol: 'circle',
-      symbolSize: 4, showSymbol: RAW.length < 40, data: pts,
-      lineStyle:{width: 2.5, color:'#2563eb'},
-      itemStyle:{color:'#2563eb'},
-      areaStyle:{color:{type:'linear', x:0, y:0, x2:0, y2:1,
-        colorStops:[{offset:0, color:'rgba(37,99,235,.22)'},{offset:1, color:'rgba(37,99,235,0)'}]}}
-    }]
+  var lo = Math.floor((mn - 0.5) * 10) / 10;
+  var hi = Math.ceil((mx + 0.5) * 10) / 10;
+  if (hi - lo < 1){ hi = lo + 1; }
+  var t0 = pts[0].t.getTime(), t1 = pts[pts.length - 1].t.getTime();
+  var span = (t1 - t0) || 1;
+  function X(t){ return padL + (t.getTime() - t0) / span * pw; }
+  function Y(v){ return padT + (hi - v) / (hi - lo) * ph; }
+  ctx.font = '10px sans-serif'; ctx.textBaseline = 'middle';
+  var steps = 4;
+  for (var s = 0; s <= steps; s++){
+    var vv = lo + (hi - lo) * s / steps;
+    var yy = Y(vv);
+    ctx.strokeStyle = '#f0f2f5'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + pw, yy); ctx.stroke();
+    ctx.fillStyle = '#9ca3af'; ctx.textAlign = 'right';
+    ctx.fillText(vv.toFixed(1), padL - 6, yy);
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#9ca3af';
+  ctx.fillText(fmtDT(pts[0].t), padL, padT + ph + 6);
+  ctx.fillText(fmtDT(pts[pts.length - 1].t), padL + pw, padT + ph + 6);
+  if (span > 36 * 3600000){
+    var mid = new Date((t0 + t1) / 2);
+    ctx.fillText(pad(mid.getMonth()+1) + '-' + pad(mid.getDate()) + ' ' +
+                 pad(mid.getHours()) + ':00', padL + pw / 2, padT + ph + 6);
+  }
+  /* 渐变面积 */
+  ctx.beginPath();
+  ctx.moveTo(X(pts[0].t), Y(pts[0].v));
+  for (var k = 1; k < pts.length; k++) ctx.lineTo(X(pts[k].t), Y(pts[k].v));
+  ctx.lineTo(X(pts[pts.length - 1].t), padT + ph);
+  ctx.lineTo(X(pts[0].t), padT + ph);
+  ctx.closePath();
+  var g = ctx.createLinearGradient(0, padT, 0, padT + ph);
+  g.addColorStop(0, 'rgba(37,99,235,.22)');
+  g.addColorStop(1, 'rgba(37,99,235,0)');
+  ctx.fillStyle = g; ctx.fill();
+  /* 折线 */
+  ctx.beginPath();
+  ctx.moveTo(X(pts[0].t), Y(pts[0].v));
+  for (var m = 1; m < pts.length; m++) ctx.lineTo(X(pts[m].t), Y(pts[m].v));
+  ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.2;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+  /* 最后一点高亮 + 数值 */
+  var lp = pts[pts.length - 1];
+  ctx.beginPath(); ctx.arc(X(lp.t), Y(lp.v), 4.5, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.lineWidth = 2.5; ctx.strokeStyle = '#2563eb'; ctx.stroke();
+  ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+  ctx.fillStyle = '#2563eb';
+  ctx.fillText(lp.v.toFixed(1) + ' 度', Math.min(X(lp.t) + 8, padL + pw - 64), Y(lp.v) - 6);
+}
+/* ============ 范围切换按钮 ============ */
+var btns = document.querySelectorAll('#ranges button');
+for (var b = 0; b < btns.length; b++){
+  btns[b].addEventListener('click', function(){
+    RANGE = this.getAttribute('data-r');
+    for (var q = 0; q < btns.length; q++) btns[q].className = '';
+    this.className = 'on';
+    draw();
   });
-  function rs(){ chart.resize(); }
-  window.addEventListener('resize', rs);
-  window.addEventListener('orientationchange', function(){ setTimeout(rs, 300); });
+}
+/* ============ 静默原地刷新 (免整页重载; 本地 file:// 时退回整页刷新) ============ */
+var useFetch = location.protocol !== 'file:';
+function refresh(){
+  if (!useFetch){ location.reload(); return; }
+  fetch('monitor_data.csv', {cache: 'no-store'})
+    .then(function(r){ if (!r.ok) throw new Error('http ' + r.status); return r.text(); })
+    .then(function(txt){
+      var rows = [];
+      var lines = txt.split(/\\r?\\n/);
+      for (var i = 0; i < lines.length; i++){
+        if (!lines[i].trim()) continue;
+        var p = lines[i].split(',');
+        if (p.length >= 4 && p[0] !== 'time'){
+          var v1 = Number(p[1]), v3 = Number(p[3]);
+          if (!isNaN(v1) && !isNaN(v3)) rows.push([p[0], v1, Number(p[2]), v3]);
+        }
+      }
+      if (rows.length){ RAW = rows; renderCard(); draw(); }
+    })
+    .catch(function(){ location.reload(); });
+}
+if (useFetch){
+  setInterval(refresh, 5 * 60 * 1000);
+  setTimeout(refresh, 2500);
+} else {
   setTimeout(function(){ location.reload(); }, 5 * 60 * 1000);
 }
-boot(0);
+/* ============ 启动 ============ */
+renderCard();
+draw();
+window.addEventListener('resize', draw);
+window.addEventListener('orientationchange', function(){ setTimeout(draw, 300); });
+requestAnimationFrame(draw);
 </script>
 </body>
 </html>
