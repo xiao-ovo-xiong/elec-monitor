@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-monitor_electricity.py - 剩余电量采集 + 折线图生成
+monitor_electricity.py - 剩余电量采集 + 折线图生成 (双房间版)
 ============================================================
+支持同时监控两个房间(4-267 / 4-265), 每个房间独立会话查询。
+
 用法:
     python monitor_electricity.py                 # 采集一次并更新图表
     python monitor_electricity.py --loop 600     # 每600秒采集一次(电脑/手机常驻时用)
     python monitor_electricity.py --chart        # 只重新生成图表不采集
 
-数据:   追加到 monitor_data.csv (time,剩余购电,剩余补助,合计)
+数据:   追加到 monitor_data.csv
+        列: time,买1,补1,合1,买2,补2,合2   (1=房间1, 2=房间2)
 图表:   生成 chart.html (网页折线图, 自包含, 手机可看) 和 chart.png (如安装了matplotlib)
 
 部署在 GitHub Actions 时, openid 等不需要保密(本来就是公开抓包得到的),
-也可以通过环境变量 MONITOR_OPENID / MONITOR_ROOMDM / MONITOR_ROOM 覆盖。
+也可以通过环境变量覆盖:
+    MONITOR_OPENID / MONITOR_ROOMDM / MONITOR_ROOM        (房间1)
+    MONITOR_ROOMDM2 / MONITOR_ROOM2                       (房间2)
+    MONITOR_BASE / MONITOR_ROOM_SHORT / MONITOR_ROOM2_SHORT
 """
 import argparse
 import datetime
@@ -50,6 +56,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ================= 配置(与 query_api.py 相同) =================
 BASE = os.environ.get("MONITOR_BASE", "http://sf.ncpu.edu.cn:9090")
 ROOM = os.environ.get("MONITOR_ROOM", "4栋/2层/4-267")
+ROOM2 = os.environ.get("MONITOR_ROOM2", "4栋/2层/4-265")
 UA = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 Language/zh "
       "ColorScheme/Light wxwork/5.0.10 (MicroMessenger/6.2) WindowsWechat  "
@@ -59,29 +66,43 @@ CONFIG = {
     "roomdm": os.environ.get("MONITOR_ROOMDM", "060267"),
     "room": ROOM,
 }
+CONFIG2 = {
+    "openid": CONFIG["openid"],
+    "roomdm": os.environ.get("MONITOR_ROOMDM2", "060265"),
+    "room": ROOM2,
+}
+ROOM_SHORT = os.environ.get("MONITOR_ROOM_SHORT", ROOM.rsplit("/", 1)[-1])
+ROOM2_SHORT = os.environ.get("MONITOR_ROOM2_SHORT", ROOM2.rsplit("/", 1)[-1])
 DATA_FILE = os.path.join(BASE_DIR, "monitor_data.csv")
 CHART_PNG = os.path.join(BASE_DIR, "chart.png")
 CHART_HTML = os.path.join(BASE_DIR, "chart.html")
 MIN_INTERVAL_S = 600   # 距上次采集不足10分钟则跳过(防重复)
+CSV_HEADER = ["time", "买1(度)", "补1(度)", "合1(度)", "买2(度)", "补2(度)", "合2(度)"]
 
 
-def query():
-    """查询当前剩余电量, 返回 (剩余购电, 剩余补助)"""
+def _get_session():
     s = requests.Session()
     s.headers["User-Agent"] = UA
     r = s.get(BASE + "/goQw", allow_redirects=True, timeout=15)
     r.raise_for_status()
+    return s
+
+
+def query_room(cfg):
+    """用独立会话查询一个房间, 返回 (剩余购电, 剩余补助)"""
+    s = _get_session()
     r = s.post(
         BASE + "/about/rebinding",
-        data={"openid": CONFIG["openid"], "roomdm": CONFIG["roomdm"],
-              "room": CONFIG["room"], "mode": "c"},
+        data={"openid": cfg["openid"], "roomdm": cfg["roomdm"],
+              "room": cfg["room"], "mode": "c"},
         headers={"X-Requested-With": "XMLHttpRequest",
                  "Referer": BASE + "/about/rebinding",
                  "Content-Type": "application/x-www-form-urlencoded"},
         timeout=15,
     )
-    if r.status_code != 200:
-        raise RuntimeError("绑定房间失败 HTTP %s" % r.status_code)
+    if r.status_code != 200 or cfg["room"] not in r.text:
+        raise RuntimeError("绑定房间 %s 失败 HTTP %s: %s" % (
+            cfg["room"], r.status_code, r.text[:100]))
     r = s.get(BASE + "/use/record",
               headers={"Referer": BASE + "/about/rebinding"}, timeout=15)
     r.raise_for_status()
@@ -96,21 +117,36 @@ def query():
     buy = grab("剩余购电")
     sub = grab("剩余补助")
     if buy is None:
-        raise RuntimeError("页面里没找到剩余购电, 学校可能改版了")
+        raise RuntimeError("页面里没找到剩余购电, 学校可能改版了 (%s)" % cfg["room"])
     return buy, (sub if sub is not None else 0.0)
 
 
 def read_rows():
+    """返回行列表: [dt, b1, s1, t1, b2, s2, t2], 缺失的房间2字段为 None"""
     rows = []
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, newline="", encoding="utf-8") as f:
             for line in csv_reader(f):
-                if len(line) >= 4 and line[0] != "time":
+                if len(line) >= 2 and line[0] != "time":
                     try:
-                        rows.append(datetime.datetime.fromisoformat(line[0]))
-                        rows[-1] = [rows[-1], float(line[1]), float(line[2]), float(line[3])]
+                        dt = datetime.datetime.fromisoformat(line[0].strip())
                     except Exception:
-                        pass
+                        continue
+
+                    def num(x):
+                        try:
+                            return float(x)
+                        except Exception:
+                            return None
+                    b1 = num(line[1]) if len(line) > 1 else None
+                    s1 = num(line[2]) if len(line) > 2 else None
+                    t1 = num(line[3]) if len(line) > 3 else None
+                    b2 = num(line[4]) if len(line) > 4 else None
+                    s2 = num(line[5]) if len(line) > 5 else None
+                    t2 = num(line[6]) if len(line) > 6 else None
+                    if b1 is None and s1 is None and t1 is None:
+                        continue
+                    rows.append([dt, b1, s1, t1, b2, s2, t2])
     return rows
 
 
@@ -119,17 +155,43 @@ def csv_reader(f):
     return csv.reader(f)
 
 
-def append_row(now, buy, sub):
+def _ensure_header():
+    """旧文件只有4列(time,买1,补1,合1)时, 迁移成7列并补空房间2字段"""
+    if not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0:
+        return
+    with open(DATA_FILE, newline="", encoding="utf-8") as f:
+        first = f.readline()
+    if first.strip() and len(first.replace("\r", "").rstrip("\n").split(",")) >= 7:
+        return  # 已是新格式
+    rows = read_rows()
+    import csv
+    with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_HEADER)
+
+        def s(x):
+            return '' if x is None else x
+        for r in rows:
+            w.writerow([r[0].isoformat(timespec="seconds"), s(r[1]), s(r[2]),
+                        s(r[3]), s(r[4]), s(r[5]), s(r[6])])
+
+
+def append_row(now, b1, s1, t1, b2, s2, t2):
     rows = read_rows()
     if rows and (now - rows[-1][0]).total_seconds() < MIN_INTERVAL_S:
         return False
+    _ensure_header()
     import csv
     first = not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0
     with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if first:
-            w.writerow(["time", "剩余购电(度)", "剩余补助(度)", "合计(度)"])
-        w.writerow([now.isoformat(timespec="seconds"), buy, sub, round(buy + sub, 2)])
+            w.writerow(CSV_HEADER)
+
+        def s(x):
+            return '' if x is None else x
+        w.writerow([now.isoformat(timespec="seconds"), s(b1), s(s1), s(t1),
+                    s(b2), s(s2), s(t2)])
     return True
 
 
@@ -139,11 +201,17 @@ def make_charts(rows):
     # ---------- chart.png ----------
     if HAS_MPL:
         try:
-            times = [r[0] for r in rows]
+            times1 = [r[0] for r in rows if r[3] is not None]
+            v1s = [r[3] for r in rows if r[3] is not None]
+            times2 = [r[0] for r in rows if r[6] is not None]
+            v2s = [r[6] for r in rows if r[6] is not None]
             fig, ax = plt.subplots(figsize=(11, 5))
-            ax.plot(times, [r[3] for r in rows], label="剩余电量(度)", lw=2.2,
+            ax.plot(times1, v1s, label="%s(度)" % ROOM_SHORT, lw=2.2,
                     marker="o", ms=3, color="#2563eb")
-            ax.set_title("宿舍剩余电量监测 %s" % ROOM)
+            if times2:
+                ax.plot(times2, v2s, label="%s(度)" % ROOM2_SHORT, lw=2.2,
+                        marker="o", ms=3, color="#10b981")
+            ax.set_title("宿舍剩余电量监测 %s / %s" % (ROOM_SHORT, ROOM2_SHORT))
             ax.set_ylabel("度")
             ax.grid(True, alpha=0.3)
             ax.legend()
@@ -154,9 +222,15 @@ def make_charts(rows):
         except Exception as e:
             print("生成 chart.png 失败(不影响网页版):", e)
     # ---------- chart.html ----------
-    data = [[r[0].astimezone().isoformat(timespec="seconds"), r[1], r[2], r[3]] for r in rows]
+    data = []
+    for r in rows:
+        data.append([r[0].astimezone().isoformat(timespec="seconds"),
+                     r[1], r[2], r[3], r[4], r[5], r[6]])
     html = TEMPLATE.replace("__DATA__", json.dumps(data, ensure_ascii=False)) \
                    .replace("__ROOM__", ROOM) \
+                   .replace("__ROOM2__", ROOM2) \
+                   .replace("__ROOM_SHORT__", ROOM_SHORT) \
+                   .replace("__ROOM2_SHORT__", ROOM2_SHORT) \
                    .replace("__COUNT__", str(len(data)))
     with open(CHART_HTML, "w", encoding="utf-8") as f:
         f.write(html)
@@ -170,7 +244,6 @@ TEMPLATE = r"""<!DOCTYPE html>
     <meta name="theme-color" content="#f2f4f7">
     <title>宿舍剩余电量</title>
     <style>
-        /* ===== 基础重置 & 全局 ===== */
         * {
             box-sizing: border-box;
             -webkit-tap-highlight-color: transparent;
@@ -183,7 +256,6 @@ TEMPLATE = r"""<!DOCTYPE html>
             color: #1f2937;
             font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
         }
-
         #app {
             display: flex;
             flex-direction: column;
@@ -193,17 +265,15 @@ TEMPLATE = r"""<!DOCTYPE html>
             margin: 0 auto;
             padding: 0 0 env(safe-area-inset-bottom) 0;
         }
-
         /* ===== 顶部摘要卡片 ===== */
         #summary {
             position: relative;
             overflow: hidden;
             background: #ffffff;
             margin: 12px 12px 10px;
-            padding: 20px 22px 16px;
+            padding: 18px 20px 14px;
             border-radius: 20px;
             box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05), 0 1px 4px rgba(0, 0, 0, 0.03);
-            transition: box-shadow 0.25s;
         }
         #summary::before {
             content: '';
@@ -212,57 +282,74 @@ TEMPLATE = r"""<!DOCTYPE html>
             top: 0;
             right: 0;
             height: 3.5px;
-            background: linear-gradient(90deg, #2563eb, #60a5fa, #93bbfc);
+            background: linear-gradient(90deg, #2563eb, #10b981, #93bbfc);
             border-radius: 20px 20px 0 0;
         }
-
-        /* 电量数值区 */
-        .power-head {
-            display: flex;
-            align-items: baseline;
-            justify-content: space-between;
-            margin-bottom: 6px;
-        }
-        .power-head .label {
+        #summary .head {
             font-size: 14px;
             font-weight: 500;
             color: #6b7280;
             letter-spacing: 0.5px;
+            margin-bottom: 10px;
         }
-        .power-head .value-wrap {
+        /* 双房间数值块 */
+        #rooms {
+            display: flex;
+            gap: 10px;
+        }
+        #rooms .room {
+            flex: 1;
+            min-width: 0;
+            background: #f7f9fc;
+            border-radius: 14px;
+            padding: 10px 12px 12px;
+        }
+        #rooms .room .rlabel {
+            font-size: 12px;
+            font-weight: 600;
+            color: #8b95a5;
+            letter-spacing: 0.3px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        #rooms .room .row {
             display: flex;
             align-items: baseline;
             gap: 4px;
+            margin-top: 3px;
         }
-        .power-head .val {
-            font-size: clamp(38px, 11vw, 54px);
+        #rooms .room .val {
+            font-size: clamp(28px, 8.5vw, 42px);
             font-weight: 700;
-            line-height: 1.1;
+            line-height: 1.15;
             font-variant-numeric: tabular-nums;
-            color: #1f2937;
-            transition: color 0.15s;
+            white-space: nowrap;
         }
-        .power-head .val.flash {
+        #rooms .room.v1 .val {
+            color: #2563eb;
+        }
+        #rooms .room.v2 .val {
+            color: #10b981;
+        }
+        #rooms .room .unit {
+            font-size: 13px;
+            color: #9ca3af;
+        }
+        #rooms .room .val.flash {
             animation: flash 0.9s ease;
         }
         @keyframes flash {
             0% {
-                color: #2563eb;
+                opacity: 0.55;
             }
             40% {
-                color: #1d4ed8;
+                opacity: 1;
             }
             100% {
-                color: #1f2937;
+                opacity: 1;
             }
         }
-        .power-head .unit {
-            font-size: 16px;
-            font-weight: 500;
-            color: #9ca3af;
-            margin-left: 2px;
-        }
-
         /* 元信息行 */
         #meta {
             display: flex;
@@ -271,7 +358,7 @@ TEMPLATE = r"""<!DOCTYPE html>
             gap: 6px 14px;
             font-size: 13px;
             color: #9ca3af;
-            margin-top: 2px;
+            margin-top: 12px;
         }
         #meta .count {
             font-weight: 600;
@@ -280,18 +367,16 @@ TEMPLATE = r"""<!DOCTYPE html>
         #meta .dot-divider {
             color: #d1d5db;
         }
-
-        /* 状态指示器 (独立一行) */
+        /* 状态指示器 */
         #status {
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-top: 12px;
+            margin-top: 10px;
             font-size: 13px;
             color: #8b95a5;
-            padding: 4px 0 2px;
             border-top: 1px solid #f0f2f5;
-            padding-top: 12px;
+            padding-top: 10px;
         }
         #status .dot {
             width: 10px;
@@ -327,18 +412,14 @@ TEMPLATE = r"""<!DOCTYPE html>
                 transform: scale(1);
             }
         }
-        #status .sttxt {
-            font-weight: 450;
-        }
         #status.updated .sttxt {
             color: #16a34a;
         }
-
-        /* 范围切换按钮组 — 分段控制器风格 */
+        /* 范围切换按钮 */
         #ranges {
             display: flex;
             gap: 6px;
-            margin-top: 14px;
+            margin-top: 12px;
             background: #f1f4f9;
             border-radius: 999px;
             padding: 4px;
@@ -365,50 +446,56 @@ TEMPLATE = r"""<!DOCTYPE html>
         #ranges button:active {
             transform: scale(0.95);
         }
-
         /* ===== 图表容器 ===== */
         #chart {
             flex: 1;
-            min-height: 220px;
+            min-height: 240px;
+            display: flex;
+            flex-direction: column;
             background: #ffffff;
             margin: 0 12px 10px;
             border-radius: 20px;
             box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05), 0 1px 4px rgba(0, 0, 0, 0.03);
             overflow: hidden;
-            position: relative;
+        }
+        #legend {
+            display: flex;
+            gap: 18px;
+            padding: 12px 16px 0;
+            font-size: 12px;
+            color: #8b95a5;
+        }
+        #legend .li {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        #legend .dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            flex: none;
+        }
+        #legend .dot.c1 {
+            background: #2563eb;
+        }
+        #legend .dot.c2 {
+            background: #10b981;
         }
         #cv {
+            flex: 1;
             display: block;
             width: 100%;
-            height: 100%;
         }
-
-        /* ===== 底部脚标 ===== */
+        /* 底部 */
         #foot {
             padding: 4px 16px 12px;
             font-size: 11px;
             color: #b6bec9;
             text-align: center;
             line-height: 1.7;
-            letter-spacing: 0.2px;
         }
-        #foot .highlight {
-            color: #9aa3b5;
-        }
-
-        /* ===== 工具类 ===== */
-        .sr-only {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            padding: 0;
-            margin: -1px;
-            overflow: hidden;
-            clip: rect(0, 0, 0, 0);
-            border: 0;
-        }
-
-        /* ===== 暗色 / 夜间模式适配 (可选) ===== */
+        /* ===== 深色模式 ===== */
         @media (prefers-color-scheme: dark) {
             html,
             body {
@@ -420,34 +507,23 @@ TEMPLATE = r"""<!DOCTYPE html>
                 background: #1c1f26;
                 box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
             }
-            #summary::before {
-                background: linear-gradient(90deg, #3b82f6, #60a5fa, #93bbfc);
-            }
-            .power-head .label {
+            #summary .head {
                 color: #9ca3af;
             }
-            .power-head .val {
-                color: #f0f2f5;
+            #rooms .room {
+                background: #242832;
             }
-            @keyframes flash {
-                0% {
-                    color: #3b82f6;
-                }
-                40% {
-                    color: #60a5fa;
-                }
-                100% {
-                    color: #f0f2f5;
-                }
+            #rooms .room.v1 .val {
+                color: #3b82f6;
+            }
+            #rooms .room.v2 .val {
+                color: #34d399;
             }
             #meta {
                 color: #6b7280;
             }
             #meta .count {
                 color: #b0b8c5;
-            }
-            #meta .dot-divider {
-                color: #374151;
             }
             #status {
                 border-top-color: #2a2f3a;
@@ -470,23 +546,38 @@ TEMPLATE = r"""<!DOCTYPE html>
                 color: #f0f2f5;
                 box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
             }
+            #legend .dot.c1 {
+                background: #3b82f6;
+            }
+            #legend .dot.c2 {
+                background: #34d399;
+            }
             #foot {
                 color: #4b5563;
             }
-            #foot .highlight {
-                color: #6b7280;
+            @keyframes flash {
+                0% {
+                    opacity: 0.4;
+                }
+                40% {
+                    opacity: 1;
+                }
+                100% {
+                    opacity: 1;
+                }
             }
-            /* Canvas 内文字颜色由 JS 控制，此处仅作示意 */
         }
-
         /* ===== 小屏微调 ===== */
         @media (max-width: 420px) {
             #summary {
-                padding: 16px 16px 14px;
+                padding: 14px 14px 12px;
                 margin: 8px 10px 8px;
             }
-            .power-head .val {
-                font-size: clamp(32px, 9vw, 42px);
+            #rooms .room {
+                padding: 8px 10px 10px;
+            }
+            #rooms .room .val {
+                font-size: clamp(24px, 7vw, 34px);
             }
             #ranges button {
                 font-size: 12px;
@@ -496,63 +587,27 @@ TEMPLATE = r"""<!DOCTYPE html>
                 font-size: 12px;
                 gap: 4px 10px;
             }
-            #status {
-                font-size: 12px;
-                margin-top: 10px;
-                padding-top: 10px;
-            }
             #chart {
-                min-height: 180px;
+                min-height: 190px;
                 margin: 0 10px 8px;
                 border-radius: 16px;
             }
             #foot {
                 font-size: 10px;
-                padding: 2px 12px 10px;
             }
         }
         @media (max-width: 360px) {
-            #summary {
-                padding: 12px 12px 12px;
-                margin: 6px 8px 6px;
-                border-radius: 16px;
+            #rooms {
+                gap: 6px;
             }
-            .power-head .val {
-                font-size: clamp(28px, 7.5vw, 34px);
+            #rooms .room {
+                padding: 6px 8px 8px;
             }
-            #ranges {
-                gap: 4px;
-                padding: 3px;
-            }
-            #ranges button {
-                font-size: 11px;
-                padding: 5px 0;
+            #rooms .room .val {
+                font-size: clamp(20px, 6vw, 28px);
             }
             #chart {
-                min-height: 150px;
-                margin: 0 8px 6px;
-                border-radius: 14px;
-            }
-        }
-
-        /* 横屏提示 (可选) */
-        @media (orientation: landscape) and (max-height: 500px) {
-            #summary {
-                padding: 12px 16px 10px;
-                margin: 6px 12px 6px;
-            }
-            .power-head .val {
-                font-size: clamp(28px, 7vw, 38px);
-            }
-            #chart {
-                min-height: 140px;
-            }
-            #ranges {
-                margin-top: 8px;
-            }
-            #status {
-                margin-top: 6px;
-                padding-top: 6px;
+                min-height: 160px;
             }
         }
     </style>
@@ -560,51 +615,57 @@ TEMPLATE = r"""<!DOCTYPE html>
 <body>
     <div id="app">
         <div id="summary">
-            <!-- 电量主信息 -->
-            <div class="power-head">
-                <span class="label">⚡ 当前剩余电量</span>
-                <span class="value-wrap">
-                    <span class="val" id="val">--</span>
-                    <span class="unit">度</span>
-                </span>
+            <div class="head">⚡ 当前剩余电量</div>
+            <div id="rooms">
+                <div class="room v1">
+                    <div class="rlabel">__ROOM_SHORT__</div>
+                    <div class="row">
+                        <span class="val" id="val1">--</span><span class="unit">度</span>
+                    </div>
+                </div>
+                <div class="room v2">
+                    <div class="rlabel">__ROOM2_SHORT__</div>
+                    <div class="row">
+                        <span class="val" id="val2">--</span><span class="unit">度</span>
+                    </div>
+                </div>
             </div>
-            <!-- 元信息 -->
             <div id="meta">
                 <span>共 <span class="count" id="recCount">0</span> 条记录</span>
                 <span class="dot-divider">·</span>
                 <span>更新于 <span id="updateTime">--</span></span>
             </div>
-            <!-- 状态 + 范围切换 -->
             <div id="status">
                 <span class="dot"></span>
                 <span class="sttxt" id="sttxt">自动更新中</span>
             </div>
-            <div id="ranges" role="tablist">
-                <button data-r="all" class="on" role="tab">全部</button>
-                <button data-r="7" role="tab">近7天</button>
-                <button data-r="30" role="tab">近30天</button>
+            <div id="ranges">
+                <button data-r="all" class="on">全部</button>
+                <button data-r="7">近7天</button>
+                <button data-r="30">近30天</button>
             </div>
         </div>
 
         <div id="chart">
+            <div id="legend">
+                <span class="li"><span class="dot c1"></span>__ROOM_SHORT__</span>
+                <span class="li"><span class="dot c2"></span>__ROOM2_SHORT__</span>
+            </div>
             <canvas id="cv"></canvas>
         </div>
 
         <div id="foot">
-            <span class="highlight">数据来自南昌工学院智能收费系统（__ROOM__）</span><br>
+            数据来自南昌工学院智能收费系统（__ROOM__ · __ROOM2__）<br>
             约 10 分钟采集一次 · 自动更新，有变化时数字与曲线会动起来
         </div>
     </div>
 
     <script>
         // ============================================================
-        //  数据
+        //  数据: [time, b1, s1, 合1, b2, s2, 合2]  (合2可能为 null)
         // ============================================================
         var RAW = __DATA__;
 
-        // ============================================================
-        //  工具函数
-        // ============================================================
         function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
         function fmtDT(ts) {
@@ -622,48 +683,67 @@ TEMPLATE = r"""<!DOCTYPE html>
         }
 
         // ============================================================
-        //  顶部卡片渲染
+        //  顶部卡片渲染 (双房间)
         // ============================================================
-        var prevTotal = null;
-        var numAnim = null;
-        var valEl = document.getElementById('val');
+        var prev1 = null,
+            prev2 = null,
+            numAnim = null;
+        var val1El = document.getElementById('val1');
+        var val2El = document.getElementById('val2');
         var recCountEl = document.getElementById('recCount');
         var updateTimeEl = document.getElementById('updateTime');
         var stEl = document.getElementById('status');
         var stTxt = document.getElementById('sttxt');
 
-        function renderCard(roll) {
-            var last = RAW.length ? RAW[RAW.length - 1] : null;
-            var total = last ? Number(last[3]) : null;
-            var target = (total === null || isNaN(total)) ? null : total;
-
-            // 数字动画
-            if (roll && target !== null && prevTotal !== null && isFinite(prevTotal) && prevTotal !== target) {
-                if (numAnim) cancelAnimationFrame(numAnim);
-                var from = prevTotal,
-                    to = target,
+        function rollValue(el, prev, now, done) {
+            if (numAnim) cancelAnimationFrame(numAnim);
+            if (prev !== null && isFinite(prev) && now !== null && isFinite(now) && prev !== now) {
+                var from = prev,
+                    to = now,
                     t0 = performance.now();
 
-                function step(now) {
-                    var k = Math.min(1, (now - t0) / 520);
+                function step(t) {
+                    var k = Math.min(1, (t - t0) / 520);
                     var e = 1 - Math.pow(1 - k, 3);
-                    valEl.textContent = (from + (to - from) * e).toFixed(2);
+                    el.textContent = (from + (to - from) * e).toFixed(2);
                     if (k < 1) {
                         numAnim = requestAnimationFrame(step);
                     } else {
-                        valEl.textContent = to.toFixed(2);
-                        valEl.classList.remove('flash');
-                        void valEl.offsetWidth;
-                        valEl.classList.add('flash');
+                        el.textContent = to.toFixed(2);
+                        if (done) done();
                     }
                 }
                 numAnim = requestAnimationFrame(step);
             } else {
-                valEl.textContent = (target === null) ? '--' : target.toFixed(2);
+                el.textContent = (now === null || !isFinite(now)) ? '--' : now.toFixed(2);
             }
-            prevTotal = target;
+        }
 
-            // 元信息
+        function renderCard(roll) {
+            var last = RAW.length ? RAW[RAW.length - 1] : null;
+            var t1 = last ? Number(last[3]) : NaN;
+            var t2 = (last && last[6] !== undefined && last[6] !== null) ? Number(last[6]) : NaN;
+            if (isNaN(t1)) t1 = null;
+            if (isNaN(t2)) t2 = null;
+            if (roll) {
+                var f1 = function() {
+                    val1El.classList.remove('flash');
+                    void val1El.offsetWidth;
+                    val1El.classList.add('flash');
+                };
+                var f2 = function() {
+                    val2El.classList.remove('flash');
+                    void val2El.offsetWidth;
+                    val2El.classList.add('flash');
+                };
+                rollValue(val1El, prev1, t1, f1);
+                rollValue(val2El, prev2, t2, f2);
+            } else {
+                val1El.textContent = (t1 === null) ? '--' : t1.toFixed(2);
+                val2El.textContent = (t2 === null) ? '--' : t2.toFixed(2);
+            }
+            prev1 = t1;
+            prev2 = t2;
             var ts = last ? new Date(last[0]) : null;
             recCountEl.textContent = RAW.length;
             updateTimeEl.textContent = ts ? fmtShort(ts) : '--';
@@ -672,22 +752,49 @@ TEMPLATE = r"""<!DOCTYPE html>
 
         function setStatus(mode) {
             stEl.className = mode;
-            if (mode === 'loading') {
-                stTxt.textContent = '正在更新…';
-            } else if (mode === 'updated') {
-                stTxt.textContent = '刚刚更新 ✓';
-            } else {
-                stTxt.textContent = '自动更新中';
-            }
+            if (mode === 'loading') stTxt.textContent = '正在更新…';
+            else if (mode === 'updated') stTxt.textContent = '刚刚更新 ✓';
+            else stTxt.textContent = '自动更新中';
         }
 
         // ============================================================
-        //  Canvas 折线图
+        //  Canvas 折线图 (双房间)
         // ============================================================
         var canvas = document.getElementById('cv');
         var ctx = canvas.getContext('2d');
         var RANGE = 'all';
         var animT = null;
+
+        function palette() {
+            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                return { c1: '#3b82f6', c2: '#34d399', a1: 'rgba(59,130,246,', a2: 'rgba(52,211,153,',
+                         text: '#d1d5db', grid: '#2a2f3a', label: '#6b7280' };
+            }
+            return { c1: '#2563eb', c2: '#10b981', a1: 'rgba(37,99,235,', a2: 'rgba(16,185,129,',
+                     text: '#1f2937', grid: '#f0f2f5', label: '#9ca3af' };
+        }
+
+        function buildSeries() {
+            var a = [],
+                b = [];
+            for (var i = 0; i < RAW.length; i++) {
+                var t = new Date(RAW[i][0]);
+                var v1 = Number(RAW[i][3]);
+                if (!isNaN(v1)) a.push({ t: t, v: v1 });
+                if (RAW[i][6] !== undefined && RAW[i][6] !== null) {
+                    var v2 = Number(RAW[i][6]);
+                    if (!isNaN(v2)) b.push({ t: t, v: v2 });
+                }
+            }
+            return [a, b];
+        }
+
+        function filterRange(pts) {
+            if (!pts.length || RANGE === 'all') return pts;
+            var end = pts[pts.length - 1].t.getTime();
+            var start = end - parseInt(RANGE, 10) * 86400000;
+            return pts.filter(function(p) { return p.t.getTime() >= start; });
+        }
 
         function traceLine(px, py, n) {
             ctx.moveTo(px[0], py[0]);
@@ -720,19 +827,10 @@ TEMPLATE = r"""<!DOCTYPE html>
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, w, h);
 
-            // 准备数据
-            var pts = [];
-            for (var i = 0; i < RAW.length; i++) {
-                var v = Number(RAW[i][3]);
-                if (isNaN(v)) continue;
-                pts.push({ t: new Date(RAW[i][0]), v: v });
-            }
-            if (RANGE !== 'all' && pts.length) {
-                var end = pts[pts.length - 1].t.getTime();
-                var start = end - parseInt(RANGE, 10) * 86400000;
-                pts = pts.filter(function(p) { return p.t.getTime() >= start; });
-            }
-            if (!pts.length) {
+            var raw = buildSeries();
+            var ptsA = filterRange(raw[0]);
+            var ptsB = filterRange(raw[1]);
+            if (!ptsA.length && !ptsB.length) {
                 ctx.fillStyle = '#9ca3af';
                 ctx.font = '13px sans-serif';
                 ctx.textAlign = 'center';
@@ -740,7 +838,7 @@ TEMPLATE = r"""<!DOCTYPE html>
                 ctx.fillText('暂无数据', w / 2, h / 2);
                 return;
             }
-
+            var P = palette();
             var padL = 48,
                 padR = 16,
                 padT = 14,
@@ -748,76 +846,66 @@ TEMPLATE = r"""<!DOCTYPE html>
             var pw = w - padL - padR,
                 ph = h - padT - padB;
 
-            // Y 轴范围
             var mn = Infinity,
                 mx = -Infinity;
-            for (var j = 0; j < pts.length; j++) {
-                if (pts[j].v < mn) mn = pts[j].v;
-                if (pts[j].v > mx) mx = pts[j].v;
+            var all = ptsA.concat(ptsB);
+            for (var j = 0; j < all.length; j++) {
+                if (all[j].v < mn) mn = all[j].v;
+                if (all[j].v > mx) mx = all[j].v;
             }
             var lo = Math.floor((mn - 0.5) * 10) / 10;
             var hi = Math.ceil((mx + 0.5) * 10) / 10;
             if (hi - lo < 1) { hi = lo + 1; }
 
-            var t0 = pts[0].t.getTime(),
-                t1 = pts[pts.length - 1].t.getTime();
+            var t0 = all[0].t.getTime(),
+                t1 = all[all.length - 1].t.getTime();
             var span = (t1 - t0) || 1;
 
             function X(t) { return padL + (t.getTime() - t0) / span * pw; }
 
             function Y(v) { return padT + (hi - v) / (hi - lo) * ph; }
 
-            var px = [],
-                py = [];
-            for (var a = 0; a < pts.length; a++) {
-                px.push(X(pts[a].t));
-                py.push(Y(pts[a].v));
+            function toXY(pts) {
+                var px = [],
+                    py = [];
+                for (var k = 0; k < pts.length; k++) { px.push(X(pts[k].t)); py.push(Y(pts[k].v)); }
+                return [px, py];
             }
+            var XYa = toXY(ptsA),
+                XYb = toXY(ptsB);
 
-            // ---- 网格 + Y轴 ----
-            var isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-            var gridColor = isDark ? '#2a2f3a' : '#f0f2f5';
-            var labelColor = isDark ? '#6b7280' : '#9ca3af';
-            var lineColor = isDark ? '#3b82f6' : '#2563eb';
-            var lineColorRgba = isDark ? 'rgba(59,130,246,' : 'rgba(37,99,235,';
-            var textColor = isDark ? '#d1d5db' : '#1f2937';
-
+            // 网格 + Y轴
             ctx.font = '10px sans-serif';
             ctx.textBaseline = 'middle';
             var steps = 4;
             for (var s = 0; s <= steps; s++) {
                 var vv = lo + (hi - lo) * s / steps;
                 var yy = Y(vv);
-                ctx.strokeStyle = gridColor;
+                ctx.strokeStyle = P.grid;
                 ctx.lineWidth = 1;
                 ctx.beginPath();
                 ctx.moveTo(padL, yy);
                 ctx.lineTo(padL + pw, yy);
                 ctx.stroke();
-                ctx.fillStyle = labelColor;
+                ctx.fillStyle = P.label;
                 ctx.textAlign = 'right';
                 ctx.fillText(vv.toFixed(1), padL - 6, yy);
             }
-
-            // ---- X轴时间 ----
+            // X轴时间
             ctx.textAlign = 'center';
             ctx.textBaseline = 'top';
-            ctx.fillStyle = labelColor;
-            ctx.font = '10px sans-serif';
-            ctx.fillText(fmtDT(pts[0].t), padL, padT + ph + 8);
-            ctx.fillText(fmtDT(pts[pts.length - 1].t), padL + pw, padT + ph + 8);
+            ctx.fillStyle = P.label;
+            ctx.fillText(fmtDT(all[0].t), padL, padT + ph + 8);
+            ctx.fillText(fmtDT(all[all.length - 1].t), padL + pw, padT + ph + 8);
             if (span > 36 * 3600000) {
                 var mid = new Date((t0 + t1) / 2);
                 ctx.fillText(
-                    pad(mid.getMonth() + 1) + '-' + pad(mid.getDate()) + ' ' +
-                    pad(mid.getHours()) + ':00',
+                    pad(mid.getMonth() + 1) + '-' + pad(mid.getDate()) + ' ' + pad(mid.getHours()) + ':00',
                     padL + pw / 2, padT + ph + 8
                 );
             }
 
             var pDone = (pg === undefined || pg === null) ? 1 : pg;
-
-            // ---- 裁剪（动画用） ----
             if (pDone < 1) {
                 ctx.save();
                 ctx.beginPath();
@@ -825,66 +913,66 @@ TEMPLATE = r"""<!DOCTYPE html>
                 ctx.clip();
             }
 
-            // ---- 面积渐变 ----
-            ctx.beginPath();
-            ctx.moveTo(px[0], py[0]);
-            traceLine(px, py, pts.length);
-            ctx.lineTo(px[px.length - 1], padT + ph);
-            ctx.lineTo(px[0], padT + ph);
-            ctx.closePath();
-            var g = ctx.createLinearGradient(0, padT, 0, padT + ph);
-            g.addColorStop(0, lineColorRgba + '0.22)');
-            g.addColorStop(1, lineColorRgba + '0)');
-            ctx.fillStyle = g;
-            ctx.fill();
-
-            // ---- 折线 ----
-            ctx.beginPath();
-            traceLine(px, py, pts.length);
-            ctx.strokeStyle = lineColor;
-            ctx.lineWidth = 2.4;
-            ctx.lineJoin = 'round';
-            ctx.lineCap = 'round';
-            ctx.stroke();
-
-            if (pDone < 1) ctx.restore();
-
-            // ---- 末点高亮 + 数值 ----
-            if (pDone >= 0.999) {
-                var lp = pts[pts.length - 1];
-                var lx = px[px.length - 1],
-                    ly = py[py.length - 1];
-                // 外发光
-                var glow = ctx.createRadialGradient(lx, ly, 2, lx, ly, 16);
-                glow.addColorStop(0, lineColorRgba + '0.25)');
-                glow.addColorStop(1, lineColorRgba + '0)');
-                ctx.fillStyle = glow;
+            // 两条曲线: 面积 + 线 + 末点标签
+            function paintSeries(px, py, lineColor, alphaPrefix, labelAbove) {
+                if (!px.length) return;
                 ctx.beginPath();
-                ctx.arc(lx, ly, 16, 0, Math.PI * 2);
+                ctx.moveTo(px[0], py[0]);
+                traceLine(px, py, px.length);
+                ctx.lineTo(px[px.length - 1], padT + ph);
+                ctx.lineTo(px[0], padT + ph);
+                ctx.closePath();
+                var g = ctx.createLinearGradient(0, padT, 0, padT + ph);
+                g.addColorStop(0, alphaPrefix + '0.20)');
+                g.addColorStop(1, alphaPrefix + '0)');
+                ctx.fillStyle = g;
                 ctx.fill();
 
                 ctx.beginPath();
-                ctx.arc(lx, ly, 5, 0, Math.PI * 2);
-                ctx.fillStyle = '#ffffff';
-                ctx.fill();
-                ctx.lineWidth = 2.8;
+                traceLine(px, py, px.length);
                 ctx.strokeStyle = lineColor;
+                ctx.lineWidth = 2.4;
+                ctx.lineJoin = 'round';
+                ctx.lineCap = 'round';
                 ctx.stroke();
 
-                ctx.font = 'bold 11px sans-serif';
-                ctx.textAlign = 'left';
-                ctx.textBaseline = 'bottom';
-                ctx.fillStyle = textColor;
-                var label = lp.v.toFixed(1) + ' 度';
-                var tx = Math.min(lx + 10, padL + pw - 70);
-                ctx.fillText(label, tx, ly - 6);
+                if (pDone >= 0.999) {
+                    var lx = px[px.length - 1],
+                        ly = py[py.length - 1];
+                    ctx.beginPath();
+                    ctx.arc(lx, ly, 5, 0, Math.PI * 2);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fill();
+                    ctx.lineWidth = 2.6;
+                    ctx.strokeStyle = lineColor;
+                    ctx.stroke();
+                    ctx.font = 'bold 11px sans-serif';
+                    ctx.textAlign = 'left';
+                    ctx.fillStyle = lineColor;
+                    var idx = (lineColor === P.c1) ? 3 : 6;
+                    var lastRow = RAW[RAW.length - 1];
+                    var lv = (lastRow && lastRow[idx] !== undefined && lastRow[idx] !== null) ? Number(lastRow[idx]) : null;
+                    var label = (lv === null || isNaN(lv)) ? '' : lv.toFixed(1) + ' 度';
+                    if (label) {
+                        var tx = Math.min(lx + 10, padL + pw - 70);
+                        if (labelAbove) {
+                            ctx.textBaseline = 'bottom';
+                            ctx.fillText(label, tx, ly - 7);
+                        } else {
+                            ctx.textBaseline = 'top';
+                            ctx.fillText(label, tx, ly + 9);
+                        }
+                    }
+                }
             }
+            paintSeries(XYa[0], XYa[1], P.c1, P.a1, true);
+            paintSeries(XYb[0], XYb[1], P.c2, P.a2, false);
+
+            if (pDone < 1) ctx.restore();
         }
 
-        // ============================================================
-        //  动画辅助
-        // ============================================================
-        function animate(pgFrom, ms, done) {
+        // 动画
+        function animate(pgFrom, ms) {
             if (animT) cancelAnimationFrame(animT);
             var t0 = performance.now(),
                 len = Math.max(1, ms);
@@ -893,12 +981,8 @@ TEMPLATE = r"""<!DOCTYPE html>
                 var k = Math.min(1, (now - t0) / len);
                 var e = 1 - Math.pow(1 - k, 3);
                 draw(pgFrom + (1 - pgFrom) * e);
-                if (k < 1) {
-                    animT = requestAnimationFrame(step);
-                } else {
-                    animT = null;
-                    if (done) done();
-                }
+                if (k < 1) animT = requestAnimationFrame(step);
+                else animT = null;
             }
             animT = requestAnimationFrame(step);
         }
@@ -936,9 +1020,19 @@ TEMPLATE = r"""<!DOCTYPE html>
                         if (!lines[i].trim()) continue;
                         var p = lines[i].split(',');
                         if (p.length >= 4 && p[0] !== 'time') {
-                            var v1 = Number(p[1]),
-                                v3 = Number(p[3]);
-                            if (!isNaN(v1) && !isNaN(v3)) rows.push([p[0], v1, Number(p[2]), v3]);
+                            function num(x) {
+                                if (x === undefined || x === null) return null;
+                                var s = String(x).trim();
+                                if (s === '') return null;
+                                var n = Number(s);
+                                return isNaN(n) ? null : n;
+                            }
+                            var row = [p[0], num(p[1]), num(p[2]), num(p[3])];
+                            if (p.length > 4) row.push(num(p[4]));
+                            if (p.length > 5) row.push(num(p[5]));
+                            if (p.length > 6) row.push(num(p[6]));
+                            if (row[3] === null && (row[6] === undefined || row[6] === null)) continue;
+                            rows.push(row);
                         }
                     }
                     if (rows.length && rows.length !== RAW.length) {
@@ -953,11 +1047,8 @@ TEMPLATE = r"""<!DOCTYPE html>
                         setStatus('idle');
                     }
                 })
-                .catch(function() {
-                    location.reload();
-                });
+                .catch(function() { location.reload(); });
         }
-
         if (useFetch) {
             setInterval(refresh, 5 * 60 * 1000);
             setTimeout(refresh, 2500);
@@ -976,20 +1067,14 @@ TEMPLATE = r"""<!DOCTYPE html>
                 animT = null; }
             draw(1);
         }
-
         var resizeTimer;
         window.addEventListener('resize', function() {
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(redraw, 120);
         });
-        window.addEventListener('orientationchange', function() {
-            setTimeout(redraw, 350);
-        });
-
-        // 暗色模式切换时重绘
+        window.addEventListener('orientationchange', function() { setTimeout(redraw, 350); });
         var darkMatch = window.matchMedia('(prefers-color-scheme: dark)');
-        darkMatch.addEventListener('change', redraw);
-
+        if (darkMatch.addEventListener) darkMatch.addEventListener('change', redraw);
         animate(0, 720);
     </script>
 </body>
@@ -1010,19 +1095,33 @@ def main():
 
     while True:
         now = datetime.datetime.now().astimezone()
+        q1 = q2 = None
         try:
-            buy, sub = query()
-            added = append_row(now, buy, sub)
-            make_charts(read_rows())
-            if added:
-                print("%s 剩余购电=%.2f 剩余补助=%.2f 合计=%.2f (已记录)" % (
-                    now.strftime("%m-%d %H:%M"), buy, sub, buy + sub))
-            else:
-                print("%s 距上次不足%d秒, 跳过记录" % (now.strftime("%H:%M:%S"), MIN_INTERVAL_S))
+            q1 = query_room(CONFIG)
         except Exception as e:
-            print("%s 采集失败: %s" % (now.strftime("%H:%M:%S"), e))
+            print("%s 房间1(%s)查询失败: %s" % (now.strftime("%H:%M:%S"), ROOM_SHORT, e))
+        try:
+            q2 = query_room(CONFIG2)
+        except Exception as e:
+            print("%s 房间2(%s)查询失败: %s" % (now.strftime("%H:%M:%S"), ROOM2_SHORT, e))
+        if q1 is None and q2 is None:
+            print("%s 两个房间都查询失败" % now.strftime("%H:%M:%S"))
             if not args.loop:
                 sys.exit(1)
+        else:
+            b1, s1 = q1 if q1 else (None, None)
+            b2, s2 = q2 if q2 else (None, None)
+            t1 = round(b1 + s1, 2) if (b1 is not None and s1 is not None) else None
+            t2 = round(b2 + s2, 2) if (b2 is not None and s2 is not None) else None
+            added = append_row(now, b1, s1, t1, b2, s2, t2)
+            make_charts(read_rows())
+            if added:
+                print("%s %s=%.2f %s=%.2f (已记录)" % (
+                    now.strftime("%m-%d %H:%M"),
+                    ROOM_SHORT, t1 if t1 is not None else 0.0,
+                    ROOM2_SHORT, t2 if t2 is not None else 0.0))
+            else:
+                print("%s 距上次不足%d秒, 跳过记录" % (now.strftime("%H:%M:%S"), MIN_INTERVAL_S))
         if not args.loop:
             break
         time.sleep(args.loop)
