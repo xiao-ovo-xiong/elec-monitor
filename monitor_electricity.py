@@ -1128,10 +1128,10 @@ TEMPLATE = r"""<!DOCTYPE html>
             }
 
             function fmtCons(c) {
-                if (c === null) return ['--', false];
-                if (c > 0.005) return [c.toFixed(2) + ' 度', false];
-                if (c < -0.005) return ['充值 +' + Math.abs(c).toFixed(2) + ' 度', true];
-                return ['0.00 度', false];
+                if (c === null) return ['--', false, false];
+                if (c > 0.005) return [c.toFixed(2) + ' 度', false, false];
+                if (c < -0.005) return ['充值 +' + Math.abs(c).toFixed(2) + ' 度', true, false];
+                return ['0.00 度', false, true];   // flat: 窗口内读数未变
             }
 
             // 平均速度: 优先近7天窗口, 其次近24h, 最后按实际跨度; 充值时跳过
@@ -1149,11 +1149,15 @@ TEMPLATE = r"""<!DOCTYPE html>
             var rateNote = r7 ? '按近7天窗口' : (r24 ? '按近24小时' : '');
             if (rUse && !rUse.full) rateNote += '(不足' + rUse.spanH.toFixed(0) + '时, 按实际跨度)';
 
+            var c24o = consumed(86400000);
+            var cTo = consumed(lastT - startOfDay(lastT));
+            var c7o = consumed(7 * 86400000);
             return {
-                c24: fmtCons(consumed(86400000)),
-                cToday: fmtCons(consumed(lastT - startOfDay(lastT))),
-                c7d: fmtCons(consumed(7 * 86400000)),
+                c24: fmtCons(c24o ? c24o.delta : null),
+                cToday: fmtCons(cTo ? cTo.delta : null),
+                c7d: fmtCons(c7o ? c7o.delta : null),
                 perH: perH !== null ? perH.toFixed(2) + ' 度/时' : '--',
+                perHLabel: r7 ? '均速(近7天)' : (r24 ? '均速(近24h)' : '均速'),
                 perHNote: rateNote,
                 daysLeft: daysLeft !== null ? daysLeft.toFixed(1) + ' 天' : '--',
                 daysNote: rateNote
@@ -1165,16 +1169,18 @@ TEMPLATE = r"""<!DOCTYPE html>
             var s = computeStats();
             if (!s) { el.innerHTML = ''; return; }
 
-            function chip(label, v, rc, tip) {
+            function chip(label, v, rc, tip, flat) {
+                var t = tip || '';
+                if (flat) t += (t ? '；' : '') + '该时段电表读数没有变化';
                 return '<span class="chip' + (rc ? ' recharge' : '') + '"' +
-                    (tip ? ' title="' + tip + '"' : '') + '>' + label +
+                    (t ? ' title="' + t + '"' : '') + '>' + label +
                     '<b>' + v + '</b></span>';
             }
             el.innerHTML =
-                chip('近24h 消耗', s.c24[0], s.c24[1], '最近24小时窗口的电量减少值(部分时段无数据时按实际跨度)') +
-                chip('今日 消耗', s.cToday[0], s.cToday[1], '从今天0点起的减少值') +
-                chip('近7天 消耗', s.c7d[0], s.c7d[1], '最近7天窗口的减少值') +
-                chip('平均', s.perH, false, s.perHNote || '每秒估算均速') +
+                chip('近24h 消耗', s.c24[0], s.c24[1], '最近24小时窗口的电量减少值(部分时段无数据时按实际跨度)', s.c24[2]) +
+                chip('今日 消耗', s.cToday[0], s.cToday[1], '从今天0点起的减少值', s.cToday[2]) +
+                chip('近7天 消耗', s.c7d[0], s.c7d[1], '最近7天窗口的减少值', s.c7d[2]) +
+                chip(s.perHLabel || '均速', s.perH, false, s.perHNote || '按当前均速') +
                 chip('预计可用', s.daysLeft, false, (s.daysNote || '按当前均速') + '估算剩余天数');
         }
 
