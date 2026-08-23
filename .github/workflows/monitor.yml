@@ -45,7 +45,12 @@ jobs:
 
       - name: Add room (if requested)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.addRoom != '' }}
-        run: python monitor_electricity.py --add-room "${{ github.event.inputs.addRoom }}" "${{ github.event.inputs.addRoomDm }}"
+        run: |
+          if [ -n "${{ github.event.inputs.addRoomDm }}" ]; then
+            python monitor_electricity.py --add-room "${{ github.event.inputs.addRoom }}" --roomdm "${{ github.event.inputs.addRoomDm }}"
+          else
+            python monitor_electricity.py --add-room "${{ github.event.inputs.addRoom }}"
+          fi
 
       - name: Commit and push
         run: |
