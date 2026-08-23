@@ -1611,7 +1611,10 @@ def add_room(rooms, room_input, dm_given=""):
         room_name = "%s/%s/%s" % (rooms[0]["name"].rsplit("/", 2)[0],
                                   floor_name or "2层", room_short)
     else:
-        dm, floor_name = find_room_dm(room_short)
+        try:
+            dm, floor_name = find_room_dm(room_short)
+        except Exception as e:
+            sys.exit("添加失败: %s" % e)
         building = rooms[0]["name"].rsplit("/", 2)[0] if rooms else "4栋"
         room_name = "%s/%s/%s" % (building, floor_name, room_short)
     # 真实绑定验证
@@ -1634,13 +1637,18 @@ def main():
     ap.add_argument("--chart", action="store_true")
     ap.add_argument("--add-room", metavar="房间号")
     ap.add_argument("--roomdm", default="")
+    ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     rooms_data = load_rooms()
     rooms = rooms_data["rooms"]
 
     if args.add_room:
-        add_room(rooms, args.add_room, args.roomdm)
+        # 兼容两种调用: --roomdm x  或 尾部直接跟房间代码(含旧的空串调用)
+        dm = args.roomdm
+        if not dm and args.extra:
+            dm = args.extra[0]
+        add_room(rooms, args.add_room, dm)
         collect(rooms, datetime.datetime.now().astimezone())
         make_charts(rooms)
         return
