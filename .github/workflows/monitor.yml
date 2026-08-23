@@ -3,7 +3,16 @@ name: electricity-monitor
 on:
   schedule:
     - cron: "*/10 * * * *"     # 每10分钟一次(UTC时间; 北京时间=UTC+8)
-  workflow_dispatch:           # 支持手动触发(部署后先手动测一次)
+  workflow_dispatch:           # 手动触发(含"添加宿舍"表单)
+    inputs:
+      addRoom:
+        description: '添加宿舍的房间号(如 4-268)。留空 = 正常采集'
+        required: false
+        default: ''
+      addRoomDm:
+        description: '可选: 房间代码(如 060268)，留空自动识别'
+        required: false
+        default: ''
 
 concurrency:
   group: electricity-monitor
@@ -15,7 +24,7 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -23,11 +32,20 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Show schedule config
+        run: |
+          echo "当前工作流调度: 每10分钟 (cron */10 按UTC)"
+          date -u "+当前时间(UTC): %H:%M:%S"
+
       - name: Install deps
         run: pip install requests
 
       - name: Collect electricity data
         run: python monitor_electricity.py
+
+      - name: Add room (if requested)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.addRoom != '' }}
+        run: python monitor_electricity.py --add-room "${{ github.event.inputs.addRoom }}" "${{ github.event.inputs.addRoomDm }}"
 
       - name: Commit and push
         run: |
