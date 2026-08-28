@@ -641,7 +641,7 @@
                 <hdr><i></i><span id="dChartName">--</span> 剩余电量走势</hdr>
                 <canvas id="cv"></canvas>
             </div>
-            <div id="foot">数据来自南昌工学院智能收费系统<br>约 10 分钟采集一次，有变化时数字与曲线会动起来</div>
+            <div id="foot">剩余电量 = 剩余购电 + 剩余补助<br>数据来自南昌工学院智能收费系统 · 约 10 分钟采集一次</div>
         </div>
 
         <button id="fab">＋</button>
@@ -654,7 +654,8 @@
                 </div>
                 <div class="desc">
                     添加新宿舍需要管理员权限（也就是你本人）。<br>
-                    填好下面两项后，页面会给你"云端添加"的引导步骤。
+                    填好下面两项后，页面会给你"云端添加"的引导步骤。<br>
+                    <span style="color:#9ca3af;font-size:12px">删除宿舍：在 Actions 的 removeRoom 输入框填房号即可（仅管理员）。</span>
                 </div>
                 <label>宿舍房间号</label>
                 <input id="inRoom" placeholder="例如 4-268">
