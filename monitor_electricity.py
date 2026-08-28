@@ -926,7 +926,7 @@ TEMPLATE = r"""<!DOCTYPE html>
                 <hdr><i></i><span id="dChartName">--</span> 剩余电量走势</hdr>
                 <canvas id="cv"></canvas>
             </div>
-            <div id="foot">数据来自南昌工学院智能收费系统<br>约 10 分钟采集一次，有变化时数字与曲线会动起来</div>
+            <div id="foot">剩余电量 = 剩余购电 + 剩余补助<br>数据来自南昌工学院智能收费系统 · 约 10 分钟采集一次</div>
         </div>
 
         <button id="fab">＋</button>
@@ -939,7 +939,8 @@ TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="desc">
                     添加新宿舍需要管理员权限（也就是你本人）。<br>
-                    填好下面两项后，页面会给你"云端添加"的引导步骤。
+                    填好下面两项后，页面会给你"云端添加"的引导步骤。<br>
+                    <span style="color:#9ca3af;font-size:12px">删除宿舍：在 Actions 的 removeRoom 输入框填房号即可（仅管理员）。</span>
                 </div>
                 <label>宿舍房间号</label>
                 <input id="inRoom" placeholder="例如 4-268">
@@ -1631,17 +1632,40 @@ def add_room(rooms, room_input, dm_given=""):
     return True
 
 
+def remove_room(rooms, room_input):
+    """按房号从列表删除宿舍, 并删除它的数据文件"""
+    short = room_input.strip().rsplit("/", 1)[-1].strip()
+    idx = next((i for i, r in enumerate(rooms) if r["short"] == short), -1)
+    if idx < 0:
+        sys.exit("列表里没有这个宿舍: %s (当前: %s)" % (
+            short, ", ".join(r["short"] for r in rooms)))
+    removed = rooms.pop(idx)
+    save_rooms(rooms)
+    p = room_csv(removed["short"])
+    if os.path.exists(p):
+        os.remove(p)
+        print("已删除数据文件:", p)
+    print("已删除宿舍 %s (%s)" % (removed["name"], removed["roomdm"]))
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", type=int, default=0)
     ap.add_argument("--chart", action="store_true")
     ap.add_argument("--add-room", metavar="房间号")
     ap.add_argument("--roomdm", default="")
+    ap.add_argument("--remove-room", metavar="房间号")
     ap.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     rooms_data = load_rooms()
     rooms = rooms_data["rooms"]
+
+    if args.remove_room:
+        remove_room(rooms, args.remove_room)
+        make_charts(rooms)
+        return
 
     if args.add_room:
         # 兼容两种调用: --roomdm x  或 尾部直接跟房间代码(含旧的空串调用)
